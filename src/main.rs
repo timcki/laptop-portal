@@ -21,6 +21,10 @@ const FLOATING_HEIGHT: &str = "75%";
 const MAX_PANE_TITLE_CHARS: usize = 80;
 const AGENT_URL_ENV: &str = "EDIT_PROPOSED_TEXT_AGENT_URL";
 const AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const WAIT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const DEFAULT_WAIT_SECS: u64 = 60 * 60;
+// `wait` exits with this while the edit is still pending at its deadline
+const WAIT_TIMED_OUT: i32 = 2;
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EditRequest {
@@ -388,7 +392,7 @@ impl EditServer {
     }
 
     #[tool(
-        description = "Open a persistent draft in a Zellij pane, or outside Zellij in Zed, locally or on the user's laptop through the edit agent. Returns immediately with pending and an edit_id. Ask the user to save and close the editor tab, then reply when ready. Call finish_edit on that reply; do not wait or repeatedly poll in one tool call. Pending is not approval.",
+        description = "Open a persistent draft in a Zellij pane, or outside Zellij in Zed, locally or on the user's laptop through the edit agent. Returns immediately with pending and an edit_id. Ask the user to save and close the editor tab, then reply when ready, or run the wait command from the server instructions in the background if you can. Call finish_edit on that reply; do not wait or repeatedly poll in one tool call. Pending is not approval.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<EditResult>()
     )]
     async fn begin_edit(
@@ -773,20 +777,88 @@ fn agent_edit_url(agent: &AgentEdit) -> String {
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for EditServer {
     fn get_info(&self) -> ServerInfo {
+        let exe = env::current_exe()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "edit-proposed-text-mcp".into());
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
                 "edit-proposed-text",
                 env!("CARGO_PKG_VERSION"),
             ))
-            .with_instructions(
+            .with_instructions(format!(
                 "Use begin_edit (or its edit_proposed_text alias) to open proposed text \
                  in Zellij or Zed, locally or on the user's laptop. It returns immediately with an edit_id, not edited text. \
                  Ask the user to save, close the editor tab, and reply when ready. On that \
-                 reply, call finish_edit. Do not poll in a long-running loop. Only completed \
-                 contains final text; pending, canceled, and failed are not approval. \
-                 Editing does not replace any required explicit approval to post content.",
-            )
+                 reply, call finish_edit. Do not poll in a long-running loop. \
+                 If you can run a shell command in the background that notifies you when it exits, \
+                 run `{exe} wait <edit_id>` that way right after begin_edit instead of waiting for a reply: \
+                 it exits once the editor tab is closed or the edit is canceled and prints the finish_edit result, \
+                 or exits {WAIT_TIMED_OUT} while still pending after an hour (`--timeout <secs>` to change). \
+                 Only completed contains final text; pending, canceled, and failed are not approval. \
+                 Closing the editor or the wait command exiting is not approval either. \
+                 Editing does not replace any required explicit approval to post content."
+            ))
     }
+}
+
+// finish_edit until the edit leaves pending or the deadline passes, so a
+// background shell command can report the closed tab without a model turn
+async fn wait_for_edit(
+    server: &EditServer,
+    edit_id: &str,
+    interval: std::time::Duration,
+    timeout: std::time::Duration,
+) -> Result<CallToolResult, ErrorData> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let result = server
+            .finish_edit(Parameters(EditIdRequest {
+                edit_id: edit_id.into(),
+            }))
+            .await?;
+        if !is_pending(&result) || tokio::time::Instant::now() >= deadline {
+            return Ok(result);
+        }
+        tokio::time::sleep(interval).await;
+    }
+}
+
+fn is_pending(result: &CallToolResult) -> bool {
+    result
+        .structured_content
+        .as_ref()
+        .is_some_and(|v| v["status"] == "pending")
+}
+
+fn parse_wait_args(args: &[String]) -> Result<(String, std::time::Duration), String> {
+    let usage = "usage: edit-proposed-text-mcp wait <edit_id> [--timeout <secs>]";
+    match args {
+        [id] => Ok((
+            id.clone(),
+            std::time::Duration::from_secs(DEFAULT_WAIT_SECS),
+        )),
+        [id, flag, secs] if flag == "--timeout" => secs
+            .parse()
+            .map(|secs| (id.clone(), std::time::Duration::from_secs(secs)))
+            .map_err(|_| usage.into()),
+        _ => Err(usage.into()),
+    }
+}
+
+async fn run_wait(server: EditServer, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let (edit_id, timeout) = parse_wait_args(args)?;
+    let result = wait_for_edit(&server, &edit_id, WAIT_INTERVAL, timeout)
+        .await
+        .map_err(|e| e.message.to_string())?;
+    let value = result
+        .structured_content
+        .clone()
+        .unwrap_or(rmcp::serde_json::Value::Null);
+    println!("{value}");
+    if is_pending(&result) {
+        std::process::exit(WAIT_TIMED_OUT);
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -804,6 +876,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .filter(|s| !s.is_empty());
     server.agent_url = env::var(AGENT_URL_ENV).ok().filter(|s| !s.is_empty());
+
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "wait") {
+        return run_wait(server, &args[1..]).await;
+    }
     let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
@@ -1353,5 +1430,88 @@ exit 0
                 .unwrap()["status"],
             "canceled"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_returns_once_the_editor_closes_and_times_out_while_pending() {
+        let root = tempfile::tempdir().unwrap();
+        let path = stored_draft(root.path(), "edit-wait").await;
+        let server = EditServer::new(root.path().into());
+        let tick = std::time::Duration::from_millis(10);
+
+        let pending = wait_for_edit(&server, "edit-wait", tick, tick * 3)
+            .await
+            .unwrap();
+        assert!(is_pending(&pending));
+
+        let close = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            fs::write(path.join("draft.md"), "after\n").await.unwrap();
+            fs::write(path.join("editor.done"), "0\n").await.unwrap();
+        });
+        let done = wait_for_edit(
+            &server,
+            "edit-wait",
+            tick,
+            std::time::Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        close.await.unwrap();
+        assert_eq!(
+            done.structured_content.unwrap(),
+            rmcp::serde_json::json!({
+                "status": "completed", "edit_id": "edit-wait", "mode": "zed",
+                "text": "after\n", "changed": true
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_follows_agent_edits_without_the_agent_url() {
+        use rmcp::serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let (url, agent, _handle) = fake_agent().await;
+        let edit_id = begin_id(&agent_server(root.path(), &url), "before\n").await;
+
+        // the wait command runs without the agent url, the edit carries it
+        let server = EditServer::new(root.path().into());
+        let tick = std::time::Duration::from_millis(10);
+        let waiting = {
+            let edit_id = edit_id.clone();
+            tokio::spawn(async move {
+                wait_for_edit(&server, &edit_id, tick, std::time::Duration::from_secs(5)).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiting.is_finished());
+        agent.lock().unwrap().status =
+            json!({"edit_id": "edit-agent-1", "status": "completed", "text": "after\n"});
+        let done = waiting.await.unwrap().unwrap();
+        assert_eq!(done.structured_content.unwrap()["text"], "after\n");
+    }
+
+    #[test]
+    fn parses_wait_arguments() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            parse_wait_args(&args(&["edit-1"])).unwrap(),
+            (
+                "edit-1".into(),
+                std::time::Duration::from_secs(DEFAULT_WAIT_SECS)
+            )
+        );
+        assert_eq!(
+            parse_wait_args(&args(&["edit-1", "--timeout", "30"])).unwrap(),
+            ("edit-1".into(), std::time::Duration::from_secs(30))
+        );
+        for bad in [
+            &[][..],
+            &["edit-1", "--timeout"],
+            &["edit-1", "--timeout", "x"],
+            &["a", "b"],
+        ] {
+            assert!(parse_wait_args(&args(bad)).is_err());
+        }
     }
 }
