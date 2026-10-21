@@ -42,6 +42,47 @@ struct EditRequest {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+struct OpenRequest {
+    #[schemars(
+        description = "Absolute path of a directory or file on this machine, e.g. the checkout the reviewing-in-zed helper printed"
+    )]
+    path: String,
+
+    #[schemars(
+        description = "SSH user the laptop connects as (default: the user running this server)"
+    )]
+    ssh_user: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Serialize, schemars::JsonSchema)]
+#[serde(tag = "status", rename_all = "lowercase")]
+#[schemars(extend("type" = "object"))]
+enum OpenResult {
+    // zed on the laptop was asked to open it
+    Opened {
+        uri: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        link: Option<String>,
+    },
+    // nothing was opened, the user has to click the link
+    Link {
+        link: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct AgentOpen<'a> {
+    user: &'a str,
+    path: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentOpened {
+    opened: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EditIdRequest {
     #[schemars(description = "The edit_id returned by begin_edit or edit_proposed_text")]
     edit_id: String,
@@ -181,6 +222,51 @@ fn cursor_placement(purpose: &str, extension: &str) -> &'static str {
     } else {
         "end"
     }
+}
+
+fn open_result(response: OpenResult) -> CallToolResult {
+    let value = rmcp::serde_json::to_value(&response).expect("OpenResult must serialize to JSON");
+    let mut result = CallToolResult::success(vec![ContentBlock::text(value.to_string())]);
+    result.structured_content = Some(value);
+    result
+}
+
+fn tool_error(msg: impl std::fmt::Display) -> CallToolResult {
+    CallToolResult::error(vec![ContentBlock::text(format!("Error: {msg}"))])
+}
+
+// the agent only accepts these, so the ssh url needs no escaping
+fn plain_remote_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.len() <= 4096
+        && path
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._~+@/-".contains(c))
+}
+
+fn valid_ssh_user(user: &str) -> bool {
+    let mut chars = user.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && user.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+// the short host name, which the laptop's ssh setup already uses for this
+// machine; only needed for the fallback link
+fn local_host() -> Option<String> {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .or_else(|| env::var("HOSTNAME").ok())
+        .map(|h| {
+            h.trim()
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+        })
+        .filter(|h| !h.is_empty())
 }
 
 fn edit_result(response: EditResult) -> CallToolResult {
@@ -656,9 +742,66 @@ impl EditServer {
             edit_id: req.edit_id,
         }))
     }
+
+    #[tool(
+        description = "Open a directory or file on this machine in the user's Zed over SSH, e.g. for a review checkout. With the edit agent configured, Zed opens on the user's laptop by itself (status opened); otherwise, or if that fails, nothing opens and the result is a zed://ssh link to give the user as a clickable link (status link). Returns immediately and waits for nothing.",
+        output_schema = rmcp::handler::server::tool::schema_for_type::<OpenResult>()
+    )]
+    async fn open_in_zed(
+        &self,
+        Parameters(req): Parameters<OpenRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let path = match fs::canonicalize(&req.path).await {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(e) => return Ok(tool_error(format!("cannot open {}: {e}", req.path))),
+        };
+        if !plain_remote_path(&path) {
+            return Ok(tool_error(format!(
+                "{path} has characters the edit agent does not accept; use letters, digits and ._~+@-"
+            )));
+        }
+        let user = req
+            .ssh_user
+            .or_else(|| env::var("USER").ok())
+            .unwrap_or_default();
+        if !valid_ssh_user(&user) {
+            return Ok(tool_error(format!("invalid ssh user {user:?}")));
+        }
+        let link = local_host().map(|host| format!("zed://ssh/{user}@{host}{path}"));
+        let reason = match &self.agent_url {
+            None => "no edit agent configured".to_string(),
+            Some(url) => match self.agent_open(url, &user, &path).await {
+                Ok(uri) => return Ok(open_result(OpenResult::Opened { uri, link })),
+                Err(msg) => format!("edit agent at {url} failed: {msg}"),
+            },
+        };
+        Ok(match link {
+            Some(link) => open_result(OpenResult::Link { link, reason }),
+            None => tool_error(format!(
+                "{reason}, and this machine has no host name for a link"
+            )),
+        })
+    }
 }
 
 impl EditServer {
+    async fn agent_open(&self, url: &str, user: &str, path: &str) -> Result<String, String> {
+        let response = self
+            .http
+            .post(format!("{}/v1/open", url.trim_end_matches('/')))
+            .json(&AgentOpen { user, path })
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("{status}: {}", body.trim()));
+        }
+        let opened: AgentOpened = response.json().await.map_err(|e| e.to_string())?;
+        Ok(opened.opened)
+    }
+
     async fn agent_create(
         &self,
         url: &str,
@@ -1236,6 +1379,7 @@ exit 0
     #[derive(Default)]
     struct FakeAgent {
         created: Vec<rmcp::serde_json::Value>,
+        opens: Vec<rmcp::serde_json::Value>,
         status: rmcp::serde_json::Value,
         deleted: Vec<String>,
     }
@@ -1278,6 +1422,20 @@ exit 0
                     |State(agent): State<SharedAgent>, UrlPath(id): UrlPath<String>| async move {
                         agent.lock().unwrap().deleted.push(id);
                         Json(json!({"edit_id": "edit-agent-1", "status": "canceled"}))
+                    },
+                ),
+            )
+            .route(
+                "/v1/open",
+                post(
+                    |State(agent): State<SharedAgent>, Json(body): Json<Value>| async move {
+                        let uri = format!(
+                            "ssh://{}@fakehost{}",
+                            body["user"].as_str().unwrap(),
+                            body["path"].as_str().unwrap()
+                        );
+                        agent.lock().unwrap().opens.push(body);
+                        Json(json!({ "opened": uri }))
                     },
                 ),
             )
@@ -1512,6 +1670,94 @@ exit 0
             &["a", "b"],
         ] {
             assert!(parse_wait_args(&args(bad)).is_err());
+        }
+    }
+
+    async fn open(server: &EditServer, path: &str, user: Option<&str>) -> CallToolResult {
+        server
+            .open_in_zed(Parameters(OpenRequest {
+                path: path.into(),
+                ssh_user: user.map(Into::into),
+            }))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn open_in_zed_asks_the_agent_and_falls_back_to_a_link() {
+        use rmcp::serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let repo = root.path().join("repo");
+        fs::create_dir(&repo).await.unwrap();
+        let canonical = fs::canonicalize(&repo).await.unwrap();
+        let canonical = canonical.to_str().unwrap();
+        let link = local_host().map(|host| format!("zed://ssh/amp@{host}{canonical}"));
+
+        let (url, agent, handle) = fake_agent().await;
+        let server = agent_server(root.path(), &url);
+        // the path is canonicalized before it is sent
+        let given = format!("{}/./", repo.display());
+        let opened = open(&server, &given, Some("amp")).await;
+        assert_eq!(opened.is_error, Some(false));
+        let mut expected =
+            json!({"status": "opened", "uri": format!("ssh://amp@fakehost{canonical}")});
+        if let Some(link) = &link {
+            expected["link"] = json!(link);
+        }
+        assert_eq!(opened.structured_content.unwrap(), expected);
+        assert_eq!(
+            agent.lock().unwrap().opens,
+            vec![json!({"user": "amp", "path": canonical})]
+        );
+
+        // no agent, or a dead one: nothing opens, the link is the way in
+        let Some(link) = link else { return };
+        let local = open(&EditServer::new(root.path().into()), canonical, Some("amp")).await;
+        assert_eq!(
+            local.structured_content.unwrap(),
+            json!({"status": "link", "link": link, "reason": "no edit agent configured"})
+        );
+        handle.abort();
+        let _ = handle.await;
+        let down = open(&agent_server(root.path(), &url), canonical, Some("amp")).await;
+        let down = down.structured_content.unwrap();
+        assert_eq!(down["status"], "link");
+        assert_eq!(down["link"], json!(link));
+        assert!(down["reason"].as_str().unwrap().contains("failed"));
+    }
+
+    #[tokio::test]
+    async fn open_in_zed_rejects_what_the_agent_would() {
+        let root = tempfile::tempdir().unwrap();
+        let (url, agent, _handle) = fake_agent().await;
+        let server = agent_server(root.path(), &url);
+        let spaced = root.path().join("a b");
+        fs::create_dir(&spaced).await.unwrap();
+
+        let missing = root.path().join("missing");
+        for (path, user) in [
+            (missing.to_str().unwrap(), Some("amp")),
+            (spaced.to_str().unwrap(), Some("amp")),
+            (root.path().to_str().unwrap(), Some("Amp;rm")),
+            (root.path().to_str().unwrap(), Some("")),
+        ] {
+            let result = open(&server, path, user).await;
+            assert_eq!(result.is_error, Some(true), "{path} as {user:?}");
+        }
+        assert!(agent.lock().unwrap().opens.is_empty());
+    }
+
+    #[test]
+    fn validates_ssh_users_and_remote_paths() {
+        for user in ["amp", "_svc", "a-b_1"] {
+            assert!(valid_ssh_user(user), "{user}");
+        }
+        for user in ["", "Amp", "1amp", "a b", "a;b", &"a".repeat(33)] {
+            assert!(!valid_ssh_user(user), "{user}");
+        }
+        assert!(plain_remote_path("/home/amp/Repos/api-v2-ws-TOK-1"));
+        for path in ["relative", "/a b", "/a?b", "/a#b", "/ż"] {
+            assert!(!plain_remote_path(path), "{path}");
         }
     }
 }

@@ -52,6 +52,7 @@ type editStore struct {
 	whois  whoIser
 	cap    tailcfg.PeerCapability
 	launch launcher
+	open   opener
 
 	mu sync.Mutex // serializes creation so the pending limit holds
 }
@@ -84,6 +85,7 @@ func (s *editStore) routes() http.Handler {
 	mux.HandleFunc("POST /v1/edits", s.create)
 	mux.HandleFunc("GET /v1/edits/{id}", s.get)
 	mux.HandleFunc("DELETE /v1/edits/{id}", s.cancel)
+	mux.HandleFunc("POST /v1/open", s.openRemote)
 	return mux
 }
 

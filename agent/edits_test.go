@@ -37,6 +37,12 @@ func (p peers) WhoIs(_ context.Context, addr string) (*apitype.WhoIsResponse, er
 type fakeEditor struct {
 	opened []string
 	exits  map[string]chan int
+	urls   []string
+}
+
+func (f *fakeEditor) open(url string) error {
+	f.urls = append(f.urls, url)
+	return nil
 }
 
 func (f *fakeEditor) launch(path string) (func() int, error) {
@@ -55,9 +61,11 @@ func newTestStore(t *testing.T) (*editStore, *fakeEditor) {
 			"100.64.0.1:1000": "granted-bigchungus",
 			"100.64.0.2:1000": "granted-other",
 			"100.64.0.3:1000": "phone",
+			"100.64.0.4:1000": "granted-devbox.tailb9dbd5.ts.net.",
 		},
 		cap:    testCap,
 		launch: editor.launch,
+		open:   editor.open,
 	}, editor
 }
 
@@ -237,6 +245,54 @@ func TestSlug(t *testing.T) {
 	} {
 		if got := slug(in); got != want {
 			t.Errorf("slug(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestOpenRemoteUsesTheCallersOwnHost(t *testing.T) {
+	s, editor := newTestStore(t)
+	const devbox = "100.64.0.4:1000"
+
+	code, out := call(t, s, devbox, "POST", "/v1/open", `{"user":"amp","path":"/home/amp/Repos/api-v2"}`)
+	if code != http.StatusOK || out["opened"] != "ssh://amp@granted-devbox/home/amp/Repos/api-v2" {
+		t.Fatalf("open: %d %v", code, out)
+	}
+	// a host in the request is ignored, the caller's tailnet name is used
+	call(t, s, devbox, "POST", "/v1/open", `{"user":"amp","path":"/srv","host":"elsewhere"}`)
+	if want := []string{"ssh://amp@granted-devbox/home/amp/Repos/api-v2", "ssh://amp@granted-devbox/srv"}; strings.Join(editor.urls, " ") != strings.Join(want, " ") {
+		t.Fatalf("urls %v", editor.urls)
+	}
+
+	for _, body := range []string{
+		`{"user":"amp","path":"relative/path"}`,
+		`{"user":"amp","path":"/home/amp/../root"}`,
+		`{"user":"amp","path":"/home/amp/a b"}`,
+		`{"user":"amp","path":"/home/amp?x=1"}`,
+		`{"user":"amp","path":"/home/amp/"}`,
+		`{"user":"Amp;rm","path":"/home/amp"}`,
+		`{"user":"","path":"/home/amp"}`,
+	} {
+		if code, _ := call(t, s, devbox, "POST", "/v1/open", body); code != http.StatusBadRequest {
+			t.Fatalf("%s: %d", body, code)
+		}
+	}
+	if code, _ := call(t, s, "100.64.0.3:1000", "POST", "/v1/open", `{"user":"amp","path":"/home/amp"}`); code != http.StatusForbidden {
+		t.Fatalf("ungranted peer: %d", code)
+	}
+	if len(editor.urls) != 2 {
+		t.Fatalf("opened for a rejected request: %v", editor.urls)
+	}
+}
+
+func TestShortHost(t *testing.T) {
+	for in, want := range map[string]string{
+		"bigchungus.tailb9dbd5.ts.net.": "bigchungus",
+		"BigChungus.example.com":        "bigchungus",
+		"devbox":                        "devbox",
+		"":                              "",
+	} {
+		if got := shortHost(in); got != want {
+			t.Errorf("shortHost(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
