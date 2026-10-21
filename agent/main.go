@@ -1,4 +1,4 @@
-// edit-proposed-text-agent opens drafts from tailnet peers in the local Zed
+// laptop-portal-agent opens drafts from tailnet peers in the local Zed
 // and hands back the saved text once the tab is closed, and opens a peer's
 // own files in Zed over ssh for reviews. it joins the tailnet
 // as its own node through tsnet, so it is reachable only over tailscale, and
@@ -21,6 +21,7 @@ import (
 )
 
 func main() {
+	// named before the repo became laptop-portal; it holds the tailnet login
 	defaultDir := "edit-proposed-text-agent"
 	if config, err := os.UserConfigDir(); err == nil {
 		defaultDir = filepath.Join(config, defaultDir)

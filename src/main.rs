@@ -922,10 +922,10 @@ impl ServerHandler for EditServer {
     fn get_info(&self) -> ServerInfo {
         let exe = env::current_exe()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "edit-proposed-text-mcp".into());
+            .unwrap_or_else(|_| "laptop-portal-mcp".into());
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new(
-                "edit-proposed-text",
+                "laptop-portal",
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(format!(
@@ -974,7 +974,7 @@ fn is_pending(result: &CallToolResult) -> bool {
 }
 
 fn parse_wait_args(args: &[String]) -> Result<(String, std::time::Duration), String> {
-    let usage = "usage: edit-proposed-text-mcp wait <edit_id> [--timeout <secs>]";
+    let usage = "usage: laptop-portal-mcp wait <edit_id> [--timeout <secs>]";
     match args {
         [id] => Ok((
             id.clone(),

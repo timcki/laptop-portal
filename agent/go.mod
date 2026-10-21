@@ -1,4 +1,4 @@
-module github.com/timcki/edit-proposed-text/agent
+module github.com/timcki/laptop-portal/agent
 
 go 1.26.6
 

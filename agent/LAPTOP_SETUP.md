@@ -1,6 +1,6 @@
-# Laptop setup: edit-proposed-text-agent
+# Laptop setup: laptop-portal-agent
 
-Instructions for a coding agent running on the user's Mac. The goal: run `edit-proposed-text-agent` on this laptop so Claude Code sessions on tailnet servers (first: `bigchungus`) can open proposed text (PR bodies, Linear comments, commit messages) in the laptop's Zed and get the edited text back.
+Instructions for a coding agent running on the user's Mac. The goal: run `laptop-portal-agent` on this laptop so Claude Code sessions on tailnet servers (first: `bigchungus`) can open proposed text (PR bodies, Linear comments, commit messages) in the laptop's Zed and get the edited text back.
 
 How it works, briefly: the agent joins the tailnet as its own node `edit-agent` (via tsnet, independent of the Tailscale app), listens only on the tailnet at `:8080`, serves only peers the tailnet policy grants `timcki.xyz/cap/edit-proposed-text`, opens each draft as a local file with `zed --wait --new`, and keeps the result until the server collects it. Full design: `README.md` in the same repo, section "Edit agent".
 
@@ -16,8 +16,8 @@ How it works, briefly: the agent joins the tailnet as its own node `edit-agent` 
 | | |
 |---|---|
 | Laptop | macOS, Apple Silicon, Tailscale **standalone** app, Remote Login **off** |
-| Server | `bigchungus` (NixOS, user `amp`), repo at `~/Repos/edit-proposed-text` |
-| Source | https://github.com/timcki/edit-proposed-text (public), agent in `agent/` |
+| Server | `bigchungus` (NixOS, user `amp`), repo at `~/Repos/laptop-portal` |
+| Source | https://github.com/timcki/laptop-portal (public), agent in `agent/` |
 | Go | 1.26.6 or newer (`agent/go.mod`) |
 | Node name / port | `edit-agent`, `tcp:8080` |
 | Capability | `timcki.xyz/cap/edit-proposed-text` |
@@ -67,25 +67,25 @@ Notes to pass on:
 ## 3. Build the binary from source
 
 ```bash
-git clone https://github.com/timcki/edit-proposed-text ~/Repos/edit-proposed-text   # or git pull if it exists
-cd ~/Repos/edit-proposed-text/agent
+git clone https://github.com/timcki/laptop-portal ~/Repos/laptop-portal   # or git pull if it exists
+cd ~/Repos/laptop-portal/agent
 git log -1 --oneline                                   # report the commit you built
 go test ./...                                          # must pass
 mkdir -p ~/.local/bin
-go build -trimpath -o ~/.local/bin/edit-proposed-text-agent .
-file ~/.local/bin/edit-proposed-text-agent             # Mach-O 64-bit executable arm64
-codesign -dv ~/.local/bin/edit-proposed-text-agent 2>&1 | grep -i signature   # adhoc is expected
+go build -trimpath -o ~/.local/bin/laptop-portal-agent .
+file ~/.local/bin/laptop-portal-agent             # Mach-O 64-bit executable arm64
+codesign -dv ~/.local/bin/laptop-portal-agent 2>&1 | grep -i signature   # adhoc is expected
 ```
 
-If the user declines installing Go, a prebuilt binary is on the server at `amp@bigchungus:Repos/edit-proposed-text/agent/dist/edit-proposed-text-agent-darwin-arm64`; `scp` it to `~/.local/bin/edit-proposed-text-agent`, `chmod 755` it, and check `shasum -a 256` against the checksum the user gives you.
+If the user declines installing Go, a prebuilt binary is on the server at `amp@bigchungus:Repos/laptop-portal/agent/dist/laptop-portal-agent-darwin-arm64`; `scp` it to `~/.local/bin/laptop-portal-agent`, `chmod 755` it, and check `shasum -a 256` against the checksum the user gives you.
 
 ## 4. Install the launchd agent (do not load it yet)
 
 ```bash
-cp ~/Repos/edit-proposed-text/agent/xyz.timcki.edit-proposed-text-agent.plist ~/Library/LaunchAgents/
+cp ~/Repos/laptop-portal/agent/xyz.timcki.laptop-portal-agent.plist ~/Library/LaunchAgents/
 # only if $HOME is not /Users/tim:
-sed -i '' "s|/Users/tim|$HOME|g" ~/Library/LaunchAgents/xyz.timcki.edit-proposed-text-agent.plist
-plutil -lint ~/Library/LaunchAgents/xyz.timcki.edit-proposed-text-agent.plist
+sed -i '' "s|/Users/tim|$HOME|g" ~/Library/LaunchAgents/xyz.timcki.laptop-portal-agent.plist
+plutil -lint ~/Library/LaunchAgents/xyz.timcki.laptop-portal-agent.plist
 ```
 
 ## 5. First run: join the tailnet
@@ -93,7 +93,7 @@ plutil -lint ~/Library/LaunchAgents/xyz.timcki.edit-proposed-text-agent.plist
 Run it in the foreground once, so the login URL is visible:
 
 ```bash
-~/.local/bin/edit-proposed-text-agent
+~/.local/bin/laptop-portal-agent
 ```
 
 - Every few seconds it prints `To start this tsnet server, restart with TS_AUTHKEY set, or go to: https://login.tailscale.com/a/...`. Ignore the auth key part; give the user that URL to open and approve, logged in as a tailnet admin.
@@ -111,9 +111,9 @@ Ask the user to check in the admin console (Machines) that `edit-agent` shows th
 ## 6. Start it under launchd
 
 ```bash
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/xyz.timcki.edit-proposed-text-agent.plist
-launchctl print gui/$(id -u)/xyz.timcki.edit-proposed-text-agent | grep -E 'state|pid'   # state = running
-tail -n 20 ~/Library/Logs/edit-proposed-text-agent.log                                     # "serving ..."
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/xyz.timcki.laptop-portal-agent.plist
+launchctl print gui/$(id -u)/xyz.timcki.laptop-portal-agent | grep -E 'state|pid'   # state = running
+tail -n 20 ~/Library/Logs/laptop-portal-agent.log                                     # "serving ..."
 ```
 
 ## 7. Verify access control from the laptop
@@ -134,15 +134,31 @@ Report to the user: the step 7 result, the node's tag, and the log tail. The ser
 ```bash
 # on bigchungus
 curl -s http://edit-agent:8080/v1/health   # expect {"caller":"bigchungus...","ok":true}
-claude mcp add edit-proposed-text -e EDIT_PROPOSED_TEXT_AGENT_URL=http://edit-agent:8080 \
-  -- ~/Repos/edit-proposed-text/target/release/edit-proposed-text-mcp
+claude mcp add laptop-portal -e EDIT_PROPOSED_TEXT_AGENT_URL=http://edit-agent:8080 \
+  -- ~/Repos/laptop-portal/target/release/laptop-portal-mcp
 ```
 
 The first real draft opens a new Zed window on the laptop named after its purpose (for example `linear-comment-int-3919.md`). Save and close the tab to hand the text back.
 
+## Migrating from edit-proposed-text
+
+If the agent was installed before the repo was renamed (binary `edit-proposed-text-agent`, label `xyz.timcki.edit-proposed-text-agent`), switch it over. The tailnet node, its login and open drafts stay, because the state directory keeps its old name:
+
+```bash
+launchctl bootout gui/$(id -u)/xyz.timcki.edit-proposed-text-agent
+cd ~/Repos && mv edit-proposed-text laptop-portal && cd laptop-portal
+git remote set-url origin https://github.com/timcki/laptop-portal && git pull
+cd agent && go test ./... && go build -trimpath -o ~/.local/bin/laptop-portal-agent .
+cp xyz.timcki.laptop-portal-agent.plist ~/Library/LaunchAgents/   # adjust /Users/tim as in step 4
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/xyz.timcki.laptop-portal-agent.plist
+rm ~/Library/LaunchAgents/xyz.timcki.edit-proposed-text-agent.plist ~/.local/bin/edit-proposed-text-agent
+```
+
+Then check step 6 and step 7 as for a new install. The old log `~/Library/Logs/edit-proposed-text-agent.log` can be deleted.
+
 ## Operations
 
-- Logs: `~/Library/Logs/edit-proposed-text-agent.log`; add `-verbose` to the plist's `ProgramArguments` for tsnet internals.
-- Restart: `launchctl kickstart -k gui/$(id -u)/xyz.timcki.edit-proposed-text-agent`. Drafts still open at a restart come back to the server as `failed`, and the server re-sends them.
-- Update: `git pull` in `~/Repos/edit-proposed-text`, rerun the `go test` and `go build` from step 3, then restart.
-- Uninstall: `launchctl bootout gui/$(id -u)/xyz.timcki.edit-proposed-text-agent`, delete the binary, the plist and `~/Library/Application Support/edit-proposed-text-agent`, then ask the user to remove the `edit-agent` machine and the policy entries in the admin console.
+- Logs: `~/Library/Logs/laptop-portal-agent.log`; add `-verbose` to the plist's `ProgramArguments` for tsnet internals.
+- Restart: `launchctl kickstart -k gui/$(id -u)/xyz.timcki.laptop-portal-agent`. Drafts still open at a restart come back to the server as `failed`, and the server re-sends them.
+- Update: `git pull` in `~/Repos/laptop-portal`, rerun the `go test` and `go build` from step 3, then restart.
+- Uninstall: `launchctl bootout gui/$(id -u)/xyz.timcki.laptop-portal-agent`, delete the binary, the plist and `~/Library/Application Support/edit-proposed-text-agent`, then ask the user to remove the `edit-agent` machine and the policy entries in the admin console.
