@@ -19,6 +19,8 @@ use tokio::fs;
 const FLOATING_WIDTH: &str = "85%";
 const FLOATING_HEIGHT: &str = "75%";
 const MAX_PANE_TITLE_CHARS: usize = 80;
+const AGENT_URL_ENV: &str = "EDIT_PROPOSED_TEXT_AGENT_URL";
+const AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct EditRequest {
@@ -47,6 +49,7 @@ enum EditMode {
     ZellijFloating,
     ZellijPane,
     Zed,
+    Agent,
 }
 
 #[derive(Debug, PartialEq, Serialize, schemars::JsonSchema)]
@@ -56,6 +59,8 @@ enum EditResult {
     Pending {
         edit_id: String,
         mode: EditMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     Completed {
         edit_id: String,
@@ -77,12 +82,45 @@ struct StoredEdit {
     original: String,
     extension: String,
     mode: EditMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent: Option<AgentEdit>,
+}
+
+// where an agent-mode draft lives on the edit agent
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct AgentEdit {
+    url: String,
+    id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AgentCreate<'a> {
+    text: &'a str,
+    extension: &'a str,
+    purpose: &'a str,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+enum AgentStatus {
+    Pending,
+    Completed { text: String },
+    Canceled,
+    Failed { exit_code: Option<i32> },
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentCreated {
+    edit_id: String,
 }
 
 #[derive(Debug, Clone)]
 struct EditServer {
     tool_router: rmcp::handler::server::router::tool::ToolRouter<EditServer>,
     state_dir: PathBuf,
+    zellij_session: Option<String>,
+    agent_url: Option<String>,
+    http: reqwest::Client,
 }
 
 fn internal_error(context: &str, err: impl std::fmt::Display) -> ErrorData {
@@ -174,15 +212,15 @@ fn resolve_zed() -> PathBuf {
     "zed".into()
 }
 
-const ZED_SCRIPT: &str = r#"#!/bin/bash
+const ZED_SCRIPT: &str = r#"#!/usr/bin/env bash
 "$3" --wait --new "$1"
 exit_code=$?
 printf "%s\n" "$exit_code" > "$2.tmp"
-/bin/mv "$2.tmp" "$2"
+mv "$2.tmp" "$2"
 "#;
 
 async fn launch_zed(script: &Path, text: &Path, done: &Path, zed: &Path) -> std::io::Result<()> {
-    let mut child = tokio::process::Command::new("/bin/bash")
+    let mut child = tokio::process::Command::new("bash")
         .arg(script)
         .arg(text)
         .arg(done)
@@ -218,7 +256,7 @@ fi
 
 exit_code=$?
 printf "%s\n" "$exit_code" > "$done_file.tmp"
-/bin/mv "$done_file.tmp" "$done_file"
+mv "$done_file.tmp" "$done_file"
 "#;
 
 struct ZellijLaunch<'a> {
@@ -329,6 +367,12 @@ impl EditServer {
         Self {
             tool_router: Self::tool_router(),
             state_dir,
+            zellij_session: None,
+            agent_url: None,
+            http: reqwest::Client::builder()
+                .timeout(AGENT_TIMEOUT)
+                .build()
+                .expect("http client must build"),
         }
     }
 
@@ -344,17 +388,15 @@ impl EditServer {
     }
 
     #[tool(
-        description = "Open a persistent draft in a Zellij pane, or Zed when outside Zellij. Returns immediately with pending and an edit_id. Ask the user to save and close the editor tab, then reply when ready. Call finish_edit on that reply; do not wait or repeatedly poll in one tool call. Pending is not approval.",
+        description = "Open a persistent draft in a Zellij pane, or outside Zellij in Zed, locally or on the user's laptop through the edit agent. Returns immediately with pending and an edit_id. Ask the user to save and close the editor tab, then reply when ready. Call finish_edit on that reply; do not wait or repeatedly poll in one tool call. Pending is not approval.",
         output_schema = rmcp::handler::server::tool::schema_for_type::<EditResult>()
     )]
     async fn begin_edit(
         &self,
         Parameters(req): Parameters<EditRequest>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = env::var("ZELLIJ_SESSION_NAME")
-            .ok()
-            .filter(|s| !s.is_empty());
-        if let Some(session) = &session {
+        let session = self.zellij_session.as_deref();
+        if let Some(session) = session {
             if let Err(msg) = ensure_session_reachable(session).await {
                 return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
                     "Error: {msg}"
@@ -381,13 +423,6 @@ impl EditServer {
             .permissions(Permissions::from_mode(0o700))
             .tempdir_in(&self.state_dir)
             .map_err(|e| internal_error("failed to create draft directory", e))?;
-        let edit_id = tmp_dir
-            .path()
-            .file_name()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-
         let text_path = tmp_dir.path().join(format!("draft.{ext}"));
         let done_path = tmp_dir.path().join("editor.done");
         let script_path = tmp_dir.path().join("run-editor.sh");
@@ -395,6 +430,30 @@ impl EditServer {
         fs::write(&text_path, &req.text)
             .await
             .map_err(|e| internal_error("failed to write draft", e))?;
+
+        // zellij keeps the edit next to the terminal, the agent is for runners
+        // without one
+        if let (None, Some(url)) = (session, &self.agent_url) {
+            let agent = match self.agent_create(url, &req.text, ext, &purpose).await {
+                Ok(agent) => agent,
+                Err(msg) => {
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(format!(
+                        "Error: failed to open the draft through the edit agent at {url}: {msg}"
+                    ))]))
+                }
+            };
+            return self
+                .store_pending(
+                    tmp_dir,
+                    &req.text,
+                    ext,
+                    EditMode::Agent,
+                    Some(agent),
+                    &purpose,
+                )
+                .await;
+        }
+
         fs::write(
             &script_path,
             if session.is_some() {
@@ -417,7 +476,7 @@ impl EditServer {
             filetype,
             cursor,
             floating,
-            session: session.as_deref().unwrap_or_default(),
+            session: session.unwrap_or_default(),
             title: &title,
         };
 
@@ -451,10 +510,30 @@ impl EditServer {
             )]));
         };
 
+        self.store_pending(tmp_dir, &req.text, ext, mode, None, &purpose)
+            .await
+    }
+
+    async fn store_pending(
+        &self,
+        tmp_dir: tempfile::TempDir,
+        original: &str,
+        ext: &str,
+        mode: EditMode,
+        agent: Option<AgentEdit>,
+        purpose: &str,
+    ) -> Result<CallToolResult, ErrorData> {
+        let edit_id = tmp_dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let stored = StoredEdit {
-            original: req.text,
+            original: original.into(),
             extension: ext.into(),
             mode,
+            agent,
         };
         fs::write(
             tmp_dir.path().join("edit.json"),
@@ -464,7 +543,11 @@ impl EditServer {
         .map_err(|e| internal_error("failed to save edit metadata", e))?;
         let _ = tmp_dir.keep();
         tracing::info!("opened {purpose} as {edit_id}");
-        Ok(edit_result(EditResult::Pending { edit_id, mode }))
+        Ok(edit_result(EditResult::Pending {
+            edit_id,
+            mode,
+            note: None,
+        }))
     }
 
     fn edit_path(&self, edit_id: &str) -> Result<PathBuf, ErrorData> {
@@ -508,12 +591,18 @@ impl EditServer {
                 edit_id: req.edit_id,
             }));
         }
+        if let Some(agent) = &stored.agent {
+            if let Some(result) = self.sync_agent(&path, &stored, agent, &req.edit_id).await? {
+                return Ok(result);
+            }
+        }
         let exit_code_raw = match fs::read_to_string(path.join("editor.done")).await {
             Ok(value) => value,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Ok(edit_result(EditResult::Pending {
                     edit_id: req.edit_id,
                     mode: stored.mode,
+                    note: None,
                 }));
             }
             Err(e) => return Err(internal_error("failed to read editor status", e)),
@@ -548,14 +637,137 @@ impl EditServer {
         Parameters(req): Parameters<EditIdRequest>,
     ) -> Result<CallToolResult, ErrorData> {
         let path = self.edit_path(&req.edit_id)?;
-        self.load_edit(&path).await?;
+        let stored = self.load_edit(&path).await?;
         fs::write(path.join("canceled"), b"")
             .await
             .map_err(|e| internal_error("failed to cancel edit", e))?;
+        // the local marker already decides the result, so an unreachable agent
+        // only keeps its copy pending until it is pruned
+        if let Some(agent) = &stored.agent {
+            if let Err(e) = self.http.delete(agent_edit_url(agent)).send().await {
+                tracing::warn!("failed to cancel {} on the edit agent: {e}", agent.id);
+            }
+        }
         Ok(edit_result(EditResult::Canceled {
             edit_id: req.edit_id,
         }))
     }
+}
+
+impl EditServer {
+    async fn agent_create(
+        &self,
+        url: &str,
+        text: &str,
+        extension: &str,
+        purpose: &str,
+    ) -> Result<AgentEdit, String> {
+        let response = self
+            .http
+            .post(format!("{}/v1/edits", url.trim_end_matches('/')))
+            .json(&AgentCreate {
+                text,
+                extension,
+                purpose,
+            })
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("{status}: {}", body.trim()));
+        }
+        let created: AgentCreated = response.json().await.map_err(|e| e.to_string())?;
+        if !valid_agent_id(&created.edit_id) {
+            return Err(format!("invalid edit id {:?}", created.edit_id));
+        }
+        Ok(AgentEdit {
+            url: url.trim_end_matches('/').into(),
+            id: created.edit_id,
+        })
+    }
+
+    // mirrors the agent's state into the local draft and markers, so a
+    // finished edit is read like any other and stays readable offline.
+    // returns a result only when the local files cannot answer yet.
+    async fn sync_agent(
+        &self,
+        path: &Path,
+        stored: &StoredEdit,
+        agent: &AgentEdit,
+        edit_id: &str,
+    ) -> Result<Option<CallToolResult>, ErrorData> {
+        let done_path = path.join("editor.done");
+        if fs::try_exists(&done_path)
+            .await
+            .map_err(|e| internal_error("failed to check editor status", e))?
+        {
+            return Ok(None);
+        }
+        let pending = |note: Option<String>| -> Result<Option<CallToolResult>, ErrorData> {
+            Ok(Some(edit_result(EditResult::Pending {
+                edit_id: edit_id.into(),
+                mode: stored.mode,
+                note,
+            })))
+        };
+        let status = match self.agent_status(agent).await {
+            Ok(status) => status,
+            Err(msg) => return pending(Some(format!("edit agent unreachable: {msg}"))),
+        };
+        let exit_code = match status {
+            AgentStatus::Pending => return pending(None),
+            AgentStatus::Canceled => {
+                fs::write(path.join("canceled"), b"")
+                    .await
+                    .map_err(|e| internal_error("failed to record cancellation", e))?;
+                return Ok(Some(edit_result(EditResult::Canceled {
+                    edit_id: edit_id.into(),
+                })));
+            }
+            AgentStatus::Completed { text } => {
+                // the draft goes first, so a crash before the marker only
+                // repeats the sync
+                fs::write(path.join(format!("draft.{}", stored.extension)), text)
+                    .await
+                    .map_err(|e| internal_error("failed to save edited text", e))?;
+                0
+            }
+            AgentStatus::Failed { exit_code } => exit_code.unwrap_or(-1),
+        };
+        let tmp = path.join("editor.done.tmp");
+        fs::write(&tmp, format!("{exit_code}\n"))
+            .await
+            .map_err(|e| internal_error("failed to record editor status", e))?;
+        fs::rename(&tmp, &done_path)
+            .await
+            .map_err(|e| internal_error("failed to record editor status", e))?;
+        Ok(None)
+    }
+
+    async fn agent_status(&self, agent: &AgentEdit) -> Result<AgentStatus, String> {
+        let response = self
+            .http
+            .get(agent_edit_url(agent))
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(format!("{status}: {}", body.trim()));
+        }
+        response.json().await.map_err(|e| e.to_string())
+    }
+}
+
+fn valid_agent_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+}
+
+fn agent_edit_url(agent: &AgentEdit) -> String {
+    format!("{}/v1/edits/{}", agent.url, agent.id)
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -568,7 +780,7 @@ impl ServerHandler for EditServer {
             ))
             .with_instructions(
                 "Use begin_edit (or its edit_proposed_text alias) to open proposed text \
-                 in Zellij or Zed. It returns immediately with an edit_id, not edited text. \
+                 in Zellij or Zed, locally or on the user's laptop. It returns immediately with an edit_id, not edited text. \
                  Ask the user to save, close the editor tab, and reply when ready. On that \
                  reply, call finish_edit. Do not poll in a long-running loop. Only completed \
                  contains final text; pending, canceled, and failed are not approval. \
@@ -587,7 +799,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let home = env::var_os("HOME").ok_or("HOME is required for persistent edit storage")?;
     let state_dir = PathBuf::from(home).join(".local/state/edit-proposed-text");
-    let service = EditServer::new(state_dir).serve(stdio()).await?;
+    let mut server = EditServer::new(state_dir);
+    server.zellij_session = env::var("ZELLIJ_SESSION_NAME")
+        .ok()
+        .filter(|s| !s.is_empty());
+    server.agent_url = env::var(AGENT_URL_ENV).ok().filter(|s| !s.is_empty());
+    let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }
@@ -595,7 +812,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::Write, process::Command};
+    use std::process::Command;
 
     async fn stored_draft(root: &Path, edit_id: &str) -> PathBuf {
         let path = root.join(edit_id);
@@ -607,6 +824,7 @@ mod tests {
                 original: "before\n".into(),
                 extension: "md".into(),
                 mode: EditMode::Zed,
+                agent: None,
             })
             .unwrap(),
         )
@@ -775,10 +993,10 @@ mod tests {
         fs::write(&script, ZED_SCRIPT).await.unwrap();
         fs::write(
             &zed,
-            r#"#!/bin/bash
+            r#"#!/usr/bin/env bash
 root="${0%/*}"
 printf '%s\n' "$@" > "$root/args"
-while [ ! -f "$root/closed" ]; do /bin/sleep 0.02; done
+while [ ! -f "$root/closed" ]; do sleep 0.02; done
 printf 'saved\n\n' > "$3"
 exit 0
 "#,
@@ -850,10 +1068,13 @@ exit 0
         let done = tmp_dir.path().join("done");
         let capture = tmp_dir.path().join("args");
         let editor = tmp_dir.path().join("nvim");
-        let mut editor_file = std::fs::File::create(&editor).unwrap();
-        editor_file
-            .write_all(b"#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n")
-            .unwrap();
+        // written and closed before it runs, linux refuses to exec a file
+        // that is still open for writing
+        std::fs::write(
+            &editor,
+            b"#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > \"$CAPTURE\"\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&editor, Permissions::from_mode(0o755)).unwrap();
         std::fs::write(&text, "draft").unwrap();
 
@@ -932,6 +1153,205 @@ exit 0
                 "changed": true,
                 "mode": "zellij-floating"
             })
+        );
+    }
+
+    #[derive(Default)]
+    struct FakeAgent {
+        created: Vec<rmcp::serde_json::Value>,
+        status: rmcp::serde_json::Value,
+        deleted: Vec<String>,
+    }
+
+    type SharedAgent = std::sync::Arc<std::sync::Mutex<FakeAgent>>;
+
+    async fn fake_agent() -> (String, SharedAgent, tokio::task::JoinHandle<()>) {
+        use axum::{
+            extract::{Path as UrlPath, State},
+            http::StatusCode,
+            routing::{get, post},
+            Json, Router,
+        };
+        use rmcp::serde_json::{json, Value};
+
+        let agent = SharedAgent::default();
+        agent.lock().unwrap().status = json!({"edit_id": "edit-agent-1", "status": "pending"});
+        let app = Router::new()
+            .route(
+                "/v1/edits",
+                post(
+                    |State(agent): State<SharedAgent>, Json(body): Json<Value>| async move {
+                        agent.lock().unwrap().created.push(body);
+                        (
+                            StatusCode::CREATED,
+                            Json(json!({"edit_id": "edit-agent-1", "status": "pending"})),
+                        )
+                    },
+                ),
+            )
+            .route(
+                "/v1/edits/{id}",
+                get(
+                    |State(agent): State<SharedAgent>, UrlPath(id): UrlPath<String>| async move {
+                        assert_eq!(id, "edit-agent-1");
+                        Json(agent.lock().unwrap().status.clone())
+                    },
+                )
+                .delete(
+                    |State(agent): State<SharedAgent>, UrlPath(id): UrlPath<String>| async move {
+                        agent.lock().unwrap().deleted.push(id);
+                        Json(json!({"edit_id": "edit-agent-1", "status": "canceled"}))
+                    },
+                ),
+            )
+            .with_state(agent.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (url, agent, handle)
+    }
+
+    fn agent_server(root: &Path, url: &str) -> EditServer {
+        let mut server = EditServer::new(root.into());
+        server.agent_url = Some(url.into());
+        server
+    }
+
+    async fn begin(server: &EditServer, text: &str) -> CallToolResult {
+        server
+            .begin_edit(Parameters(EditRequest {
+                text: text.into(),
+                purpose: Some("Linear comment".into()),
+                file_extension: None,
+                floating: None,
+            }))
+            .await
+            .unwrap()
+    }
+
+    async fn begin_id(server: &EditServer, text: &str) -> String {
+        begin(server, text).await.structured_content.unwrap()["edit_id"]
+            .as_str()
+            .unwrap()
+            .into()
+    }
+
+    #[tokio::test]
+    async fn agent_edits_complete_through_the_agent_and_stay_readable_offline() {
+        use rmcp::serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let (url, agent, handle) = fake_agent().await;
+        let server = agent_server(root.path(), &url);
+
+        let pending = begin(&server, "before\n").await.structured_content.unwrap();
+        let edit_id = pending["edit_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            pending,
+            json!({"status": "pending", "edit_id": edit_id, "mode": "agent"})
+        );
+        assert_eq!(
+            agent.lock().unwrap().created,
+            vec![json!({"text": "before\n", "extension": "md", "purpose": "Linear comment"})]
+        );
+        assert_eq!(
+            finish(&server, &edit_id).await.structured_content.unwrap()["status"],
+            "pending"
+        );
+
+        agent.lock().unwrap().status = json!({
+            "edit_id": "edit-agent-1", "status": "completed", "text": " after\n\nżółć\n", "changed": true
+        });
+        let expected = json!({
+            "status": "completed", "edit_id": edit_id, "mode": "agent",
+            "text": " after\n\nżółć\n", "changed": true
+        });
+        assert_eq!(
+            finish(&server, &edit_id).await.structured_content.unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join(&edit_id).join("draft.md"))
+                .await
+                .unwrap(),
+            " after\n\nżółć\n"
+        );
+
+        // the result was mirrored locally, so it no longer needs the agent
+        handle.abort();
+        let _ = handle.await;
+        let restarted = agent_server(root.path(), &url);
+        assert_eq!(
+            finish(&restarted, &edit_id)
+                .await
+                .structured_content
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[tokio::test]
+    async fn unreachable_agent_keeps_edits_pending_and_refuses_new_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let (url, _agent, handle) = fake_agent().await;
+        let edit_id = begin_id(&agent_server(root.path(), &url), "before\n").await;
+        handle.abort();
+        let _ = handle.await;
+
+        // a fresh client, so no pooled connection outlives the agent
+        let server = agent_server(root.path(), &url);
+        let pending = finish(&server, &edit_id).await.structured_content.unwrap();
+        assert_eq!(pending["status"], "pending");
+        assert!(pending["note"]
+            .as_str()
+            .unwrap()
+            .starts_with("edit agent unreachable"));
+
+        let refused = begin(&server, "x").await;
+        assert_eq!(refused.is_error, Some(true));
+        // a refused edit leaves no draft behind
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_cancellation_and_failures_carry_over() {
+        use rmcp::serde_json::json;
+        let root = tempfile::tempdir().unwrap();
+        let (url, agent, _handle) = fake_agent().await;
+        let server = agent_server(root.path(), &url);
+
+        let canceled = begin_id(&server, "before\n").await;
+        let result = server
+            .cancel_edit(Parameters(EditIdRequest {
+                edit_id: canceled.clone(),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result.structured_content.unwrap()["status"], "canceled");
+        assert_eq!(agent.lock().unwrap().deleted, vec!["edit-agent-1"]);
+        agent.lock().unwrap().status = json!({"edit_id": "edit-agent-1", "status": "completed", "text": "must not be accepted"});
+        assert_eq!(
+            finish(&server, &canceled).await.structured_content.unwrap()["status"],
+            "canceled"
+        );
+
+        let failed = begin_id(&server, "before\n").await;
+        agent.lock().unwrap().status =
+            json!({"edit_id": "edit-agent-1", "status": "failed", "exit_code": 3});
+        let result = finish(&server, &failed).await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap(),
+            json!({"status": "failed", "edit_id": failed, "exit_code": 3})
+        );
+
+        let agent_canceled = begin_id(&server, "before\n").await;
+        agent.lock().unwrap().status = json!({"edit_id": "edit-agent-1", "status": "canceled"});
+        assert_eq!(
+            finish(&server, &agent_canceled)
+                .await
+                .structured_content
+                .unwrap()["status"],
+            "canceled"
         );
     }
 }
