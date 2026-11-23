@@ -77,7 +77,7 @@ func main() {
 		dir:    edits,
 		whois:  lc,
 		cap:    tailcfg.PeerCapability(*capName),
-		launch: zedLauncher(*zed),
+		launch: zedLauncher(*zed, edits),
 		open:   zedOpener(*zed),
 	}
 	store.failInterrupted()

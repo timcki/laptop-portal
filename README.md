@@ -38,7 +38,7 @@ Drafts and metadata live in `~/.local/state/edit-proposed-text/` with private di
 
 ## Edit agent
 
-`agent/` holds `laptop-portal-agent`, a small Go service for when the MCP server runs on a headless machine and you edit on a laptop. It joins your tailnet as its own node through [tsnet](https://tailscale.com/docs/reference/tsnet-server-api), so it is reachable only over Tailscale and does not need Remote Login or an open port on the laptop. It opens each draft as a local file with `zed --wait --new` (the tab is named after the purpose), opens a server's own files over SSH for `open_in_zed`, and keeps the result until the MCP server collects it, so an edit survives the laptop sleeping and MCP restarts.
+`agent/` holds `laptop-portal-agent`, a small Go service for when the MCP server runs on a headless machine and you edit on a laptop. It joins your tailnet as its own node through [tsnet](https://tailscale.com/docs/reference/tsnet-server-api), so it is reachable only over Tailscale and does not need Remote Login or an open port on the laptop. It opens each draft as a local file in a dedicated Zed drafts window, created on first use and reused after that (the tab is named after the purpose), opens a server's own files over SSH for `open_in_zed`, and keeps the result until the MCP server collects it, so an edit survives the laptop sleeping and MCP restarts.
 
 Only tailnet peers granted the `timcki.xyz/cap/edit-proposed-text` capability can use it, checked per request with the tailnet's WhoIs, and each server can only read its own edits. Adding a server is a policy change: tag it `tag:claude-server`. Traffic is plain HTTP inside WireGuard, which already encrypts and authenticates both ends.
 

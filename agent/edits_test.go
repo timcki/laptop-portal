@@ -296,3 +296,35 @@ func TestShortHost(t *testing.T) {
 		}
 	}
 }
+
+func TestZedLauncherOpensDraftsWindowThenWaitsOnFile(t *testing.T) {
+	root := t.TempDir()
+	drafts := filepath.Join(root, "drafts dir")
+	path := filepath.Join(drafts, "edit-1", "pr description.md")
+	zed := filepath.Join(root, "fake zed")
+	script := `#!/bin/bash
+root="${0%/*}"
+printf '%s\n' "$@" >> "$root/calls"
+echo -- >> "$root/calls"
+[ "$1" = --wait ] && exit 3
+exit 0
+`
+	if err := os.WriteFile(zed, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	wait, err := zedLauncher(zed, drafts)(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := wait(); code != 3 {
+		t.Fatalf("exit code = %d, want 3", code)
+	}
+	calls, err := os.ReadFile(filepath.Join(root, "calls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := drafts + "\n" + path + "\n--\n--wait\n" + path + "\n--\n"
+	if string(calls) != want {
+		t.Fatalf("zed calls = %q, want %q", calls, want)
+	}
+}

@@ -358,10 +358,15 @@ func slug(purpose string) string {
 
 // zedLauncher runs the zed cli with --wait, which only returns once the tab
 // is closed. zed reports a tab closed without saving as success, so the
-// saved file is what counts.
-func zedLauncher(zed string) launcher {
+// saved file is what counts. opening drafts alongside the file first reuses
+// (or creates once) a dedicated drafts window; --wait only gets the file
+// since waiting on a dir blocks until the whole window closes.
+func zedLauncher(zed, drafts string) launcher {
 	return func(path string) (func() int, error) {
-		cmd := exec.Command(zed, "--wait", "--new", path)
+		if err := exec.Command(zed, drafts, path).Run(); err != nil {
+			log.Printf("failed to open drafts window: %v", err)
+		}
+		cmd := exec.Command(zed, "--wait", path)
 		if err := cmd.Start(); err != nil {
 			return nil, err
 		}
