@@ -302,19 +302,29 @@ fn resolve_zed() -> PathBuf {
     "zed".into()
 }
 
+// opening the drafts dir alongside the file reuses (or creates once) a dedicated drafts window;
+// --wait only gets the file since waiting on a dir blocks until the whole window closes
 const ZED_SCRIPT: &str = r#"#!/usr/bin/env bash
-"$3" --wait --new "$1"
+"$3" "$4" "$1"
+"$3" --wait "$1"
 exit_code=$?
 printf "%s\n" "$exit_code" > "$2.tmp"
 mv "$2.tmp" "$2"
 "#;
 
-async fn launch_zed(script: &Path, text: &Path, done: &Path, zed: &Path) -> std::io::Result<()> {
+async fn launch_zed(
+    script: &Path,
+    text: &Path,
+    done: &Path,
+    zed: &Path,
+    drafts: &Path,
+) -> std::io::Result<()> {
     let mut child = tokio::process::Command::new("bash")
         .arg(script)
         .arg(text)
         .arg(done)
         .arg(zed)
+        .arg(drafts)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -572,9 +582,15 @@ impl EditServer {
 
         // try floating first, fall back to embedded pane
         let mode = if session.is_none() {
-            launch_zed(&script_path, &text_path, &done_path, &resolve_zed())
-                .await
-                .map_err(|e| internal_error("failed to launch Zed", e))?;
+            launch_zed(
+                &script_path,
+                &text_path,
+                &done_path,
+                &resolve_zed(),
+                &self.state_dir,
+            )
+            .await
+            .map_err(|e| internal_error("failed to launch Zed", e))?;
             Some(EditMode::Zed)
         } else if floating {
             match launch_zellij(&launch(true)).await {
@@ -1207,6 +1223,8 @@ mod tests {
         let script = root.path().join("run-editor.sh");
         let zed = root.path().join("fake zed");
         let done = root.path().join("editor.done");
+        let drafts = root.path().join("drafts dir");
+        let open_capture = root.path().join("open-args");
         let capture = root.path().join("args");
         let gate = root.path().join("closed");
         fs::write(&path, "before").await.unwrap();
@@ -1215,9 +1233,13 @@ mod tests {
             &zed,
             r#"#!/usr/bin/env bash
 root="${0%/*}"
+if [ "$1" != --wait ]; then
+  printf '%s\n' "$@" > "$root/open-args"
+  exit 0
+fi
 printf '%s\n' "$@" > "$root/args"
 while [ ! -f "$root/closed" ]; do sleep 0.02; done
-printf 'saved\n\n' > "$3"
+printf 'saved\n\n' > "$2"
 exit 0
 "#,
         )
@@ -1228,7 +1250,7 @@ exit 0
             .unwrap();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            launch_zed(&script, &path, &done, &zed),
+            launch_zed(&script, &path, &done, &zed, &drafts),
         )
         .await
         .unwrap()
@@ -1243,7 +1265,11 @@ exit 0
         assert!(!done.exists());
         assert_eq!(
             fs::read_to_string(&capture).await.unwrap(),
-            format!("--wait\n--new\n{}\n", path.display())
+            format!("--wait\n{}\n", path.display())
+        );
+        assert_eq!(
+            fs::read_to_string(&open_capture).await.unwrap(),
+            format!("{}\n{}\n", drafts.display(), path.display())
         );
         fs::write(gate, b"").await.unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
